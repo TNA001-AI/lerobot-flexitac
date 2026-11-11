@@ -1,32 +1,32 @@
-# FlexiTac Hardware & SO-10X Gripper Setup
+# FlexiTac hardware and SO-10X gripper setup
 
-This directory documents the physical integration of the **FlexiTac** (`12 × 32`) array tactile sensor onto SO-100 / SO-101 / SO-10X grippers.
+## 1. 3D-printed gripper parts
 
-## 1. Custom 3D-Printed Gripper Parts
+Replace two stock SO-10X parts so the FlexiTac pad sits flat on the jaw and its cable has clearance:
 
-To mount the FlexiTac pad cleanly and accommodate sensor ribbon routing, replace two stock SO-10X gripper parts:
+| File | Part |
+| :--- | :--- |
+| [`Moving_Jaw_08d.stl`](Moving_Jaw_08d.stl) | Moving jaw that holds the `12 × 32` FlexiTac pad |
+| [`Wrist_Roll_08c.stl`](Wrist_Roll_08c.stl) | Wrist roll replacement matching the new jaw geometry and cable routing |
 
-1. **Moving Jaw** — holds the `12 × 32` FlexiTac sensor pad flat against the grasping surface.
-2. **Wrist Roll** — replaces the stock SO-10X wrist roll housing to accommodate the modified jaw geometry and USB/FPC cable clearance.
+Interactive 3D previews: https://tna001-ai.github.io/LeFlexiTac/docs.html
 
-Download the STL files and view interactive 3D previews on the official project documentation:
-- **Project Hardware Guide & STL Downloads**: https://tna001-ai.github.io/LeFlexiTac/docs.html
+## 2. Firmware and driver check (PyFlexiTac)
 
-*(Tip: You can also drop `moving_jaw_flexitac.stl` and `wrist_roll_flexitac.stl` directly into this `hardware/` folder before pushing to GitHub.)*
+FlexiTac streams frames of `0xAA 0x55` followed by `12 × 32` uint8 values at **2,000,000 baud**.
 
-## 2. Firmware Flashing & Driver Verification (`PyFlexiTac`)
-
-FlexiTac communicates over USB serial at **`2,000,000` baud**.
-
-1. Install `PyFlexiTac` with examples:
+1. Install the driver (Python ≥ 3.11):
    ```bash
    pip install "flexitac[examples]"
-   # Or from source: https://github.com/WT-MM/PyFlexiTac
    ```
-2. Grant serial port permissions on Linux:
+2. Give your user serial-port access on Linux, then log out and back in:
    ```bash
    sudo usermod -aG dialout $USER
-   # Or temporary permission for current session:
-   sudo chmod 666 /dev/ttyUSB0
    ```
-3. Verify live `12 × 32` tactile streaming using `PyFlexiTac`'s built-in CLI heatmap viewer before launching `lerobot-teleoperate` or `lerobot-record`.
+3. Find the port. The board has no identifying USB descriptor, so use unplug/replug detection:
+   ```bash
+   flexitac-find-port
+   ```
+4. Flash the firmware and check the live heatmap with PyFlexiTac's tools (see its README) before you run `lerobot-teleoperate` or `lerobot-record`.
+
+Keep the pad unloaded while connecting. `flexitac` calibrates a per-taxel baseline from the first `init_frames` (30) frames, unless you pass a fixed `baseline`.

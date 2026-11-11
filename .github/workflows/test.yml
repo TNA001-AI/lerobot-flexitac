@@ -9,29 +9,51 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.10", "3.12"]
+        include:
+          # Oldest supported: LeRobot 0.3.x layout (so101_follower, in-policy normalization).
+          - python-version: "3.11"
+            lerobot: "lerobot==0.3.4"
+          # Latest LeRobot from PyPI (unified so_follower, processor pipelines).
+          - python-version: "3.12"
+            lerobot: "lerobot"
+    name: py${{ matrix.python-version }} / ${{ matrix.lerobot }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install stock LeRobot and test dependencies
+      - name: Install LeRobot and the plugins (real dependency resolution, no --no-deps)
         run: |
           python -m pip install --upgrade pip
-          pip install lerobot pytest opencv-python
-          pip install -e ./lerobot_tactile_flexitac --no-deps
-          pip install -e ./lerobot_robot_so_flexitac --no-deps
-          pip install -e ./lerobot_policy_tactile --no-deps
-      - name: Verify distribution names keep underscores for plugin discovery
+          pip install "${{ matrix.lerobot }}" pytest opencv-python-headless
+          pip install -e ./lerobot_tactile_flexitac
+          pip install -e ./lerobot_robot_so_flexitac
+          pip install -e ./lerobot_policy_tactile
+          python -c "import lerobot, flexitac; print('lerobot', __import__('importlib.metadata').metadata.version('lerobot'), '| flexitac', flexitac.__version__)"
+      - name: Verify distribution names keep underscores (LeRobot plugin discovery)
         run: |
-          python -c "
+          python - <<'EOF'
           import importlib.metadata as m
-          names = {d.metadata['Name'] for d in m.distributions() if d.metadata.get('Name')}
-          for expected in ('lerobot_tactile_flexitac', 'lerobot_robot_so_flexitac', 'lerobot_policy_tactile'):
-              assert expected in names, f'{expected} missing from {names}'
-          print('Verified plugin distribution names:', expected)
-          "
-      - name: Run unit tests
+          names = {d.metadata["Name"] for d in m.distributions() if d.metadata.get("Name")}
+          for expected in ("lerobot_tactile_flexitac", "lerobot_robot_so_flexitac", "lerobot_policy_tactile"):
+              assert expected in names, f"{expected} missing from installed distributions"
+          print("plugin distributions OK")
+          EOF
+      - name: Verify LeRobot auto-discovers and registers the plugins
         run: |
-          pytest -v lerobot_tactile_flexitac/tests lerobot_robot_so_flexitac/tests lerobot_policy_tactile/tests
+          python - <<'EOF'
+          from lerobot.utils.import_utils import register_third_party_plugins
+          register_third_party_plugins()
+          from lerobot.cameras.configs import CameraConfig
+          from lerobot.robots.config import RobotConfig
+          from lerobot.configs.policies import PreTrainedConfig
+          assert "flexitac" in CameraConfig.get_known_choices()
+          assert "so_tactile_follower" in RobotConfig.get_known_choices()
+          assert "act_tactile" in PreTrainedConfig.get_known_choices()
+          print("auto-discovery OK")
+          EOF
+        if: ${{ matrix.lerobot == 'lerobot' }}
+      - name: Run unit tests
+        run: pytest -v -rs lerobot_tactile_flexitac/tests lerobot_robot_so_flexitac/tests lerobot_policy_tactile/tests

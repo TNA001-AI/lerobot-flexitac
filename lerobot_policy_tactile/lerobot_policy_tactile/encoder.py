@@ -142,52 +142,51 @@ def extract_tactile_maps_from_batch(
     *,
     tactile_shape: tuple[int, int] = (12, 32),
     proprio_dim: int = 6,
+    n_tactile_sensors: int = 1,
     tactile_keys: list[str] | None = None,
+    state_key: str = "observation.state",
 ) -> tuple[Tensor | None, list[Tensor]]:
-    """Extract proprioceptive state and ``(B, rows, cols)`` tactile map(s) from a training/inference batch.
+    """Split a batch into proprioceptive state and ``(B, rows, cols)`` tactile maps.
 
-    Supports three dataset storage formats seamlessly:
-    1. Explicit keys in ``tactile_keys`` (either ``observation.tactile.*`` ``(B, H, W)`` or
-       ``observation.images.tactile_*`` ``(B, C, H_img, W_img)``).
-    2. Flattened lossless ``float32`` state produced by ``SOTactileFollower`` where
-       ``observation.state`` has ``proprio_dim + k * (rows * cols)`` columns.
+    Two explicit modes (no guessing from tensor sizes):
+
+    - ``tactile_keys`` set: read each key. ``(B, H, W)`` tensors (``observation.tactile.*``)
+      are used as-is; ``(B, C, H, W)`` image streams (``observation.images.tactile_*``) are
+      averaged over channels and nearest-resized to ``tactile_shape``. Note image streams
+      arrive already normalized by the policy preprocessor. State is returned unchanged.
+    - otherwise: ``observation.state`` must be exactly
+      ``proprio_dim + n_tactile_sensors * rows * cols`` wide, as produced by
+      ``SOTactileFollower`` (use ``infer_tactile_layout`` to get these numbers).
     """
     rows, cols = tactile_shape
-    taxels_per_pad = rows * cols
-    state = batch.get("observation.state")
+    state = batch.get(state_key)
 
-    # Path 1: Explicit tactile tensor or tactile stream image keys
     if tactile_keys:
         maps: list[Tensor] = []
         for key in tactile_keys:
             if key not in batch:
-                raise KeyError(f"Configured tactile key {key!r} not found in batch keys {list(batch.keys())}")
+                raise KeyError(f"Configured tactile key {key!r} not found in batch keys {sorted(batch)}")
             t = batch[key].float()
             if t.dim() == 4:
-                # Image stream (B, C, H, W) -> grayscale -> nearest downsample to (rows, cols)
                 gray = t.mean(dim=1, keepdim=True)
                 if gray.shape[-2:] != (rows, cols):
                     gray = F.interpolate(gray, size=(rows, cols), mode="nearest")
                 t = gray.squeeze(1)
-            elif t.dim() != 3:
+            elif t.dim() != 3 or tuple(t.shape[-2:]) != (rows, cols):
                 raise ValueError(f"Unsupported tactile tensor shape {tuple(t.shape)} for key {key!r}")
             maps.append(t)
         return state, maps
 
-    # Path 2: Auto-slice flattened float32 tactile maps from observation.state
-    if state is not None:
-        total_dim = state.shape[-1]
-        rem = total_dim - proprio_dim
-        if rem > 0 and rem % taxels_per_pad == 0:
-            n_pads = rem // taxels_per_pad
-            proprio = state[..., :proprio_dim]
-            tactile_flat = state[..., proprio_dim:]
-            bsz = tactile_flat.shape[0]
-            # Handle optional n_obs_steps=1 dimension if present
-            if tactile_flat.dim() == 3 and tactile_flat.shape[1] == 1:
-                tactile_flat = tactile_flat.squeeze(1)
-                proprio = proprio.squeeze(1)
-            pads = tactile_flat.reshape(bsz, n_pads, rows, cols)
-            return proprio, [pads[:, i] for i in range(n_pads)]
-
-    return state, []
+    if state is None:
+        raise KeyError(f"{state_key!r} is required when tactile is stored in the state (no tactile_keys given)")
+    expected = proprio_dim + n_tactile_sensors * rows * cols
+    if state.shape[-1] != expected:
+        raise ValueError(
+            f"{state_key} has {state.shape[-1]} columns but the configured layout needs {expected} "
+            f"(proprio_dim={proprio_dim} + {n_tactile_sensors} x {rows}x{cols}). "
+            "Derive the layout from the dataset with lerobot_policy_tactile.infer_tactile_layout()."
+        )
+    lead = state.shape[:-1]
+    proprio = state[..., :proprio_dim]
+    pads = state[..., proprio_dim:].reshape(*lead, n_tactile_sensors, rows, cols)
+    return proprio, [pads[..., i, :, :] for i in range(n_tactile_sensors)]

@@ -1,7 +1,8 @@
-"""Unit tests for lerobot_robot_so_flexitac without physical hardware."""
+"""Hardware-free tests for lerobot_robot_so_flexitac."""
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -17,26 +18,75 @@ from lerobot_robot_so_flexitac import (
     unflatten_tactile_state,
 )
 
+SHAPE = (12, 32)
+
 
 class _FakeTactileSensor:
-    def __init__(self, shape: tuple[int, int] = (12, 32)):
-        self.shape = shape
+    def __init__(self, fail_connect: bool = False):
         self.is_connected = False
-        self.should_fail = False
-        self.data = np.arange(shape[0] * shape[1], dtype=np.float32).reshape(shape) / float(
-            shape[0] * shape[1]
-        )
+        self.fail_connect = fail_connect
+        self.fail_reads = False
+        self.listeners = []
+        self.data = np.arange(SHAPE[0] * SHAPE[1], dtype=np.float32).reshape(SHAPE) / (SHAPE[0] * SHAPE[1])
 
     def connect(self, warmup: bool = True) -> None:
+        if self.fail_connect:
+            raise TimeoutError("no frame from fake sensor")
         self.is_connected = True
 
     def disconnect(self) -> None:
         self.is_connected = False
 
-    def read_latest_tactile(self) -> np.ndarray:
-        if self.should_fail:
-            raise OSError("Simulated serial timeout")
+    def add_frame_listener(self, cb) -> None:
+        self.listeners.append(cb)
+
+    def remove_frame_listener(self, cb) -> None:
+        self.listeners.remove(cb)
+
+    def emit(self, seq: int) -> None:
+        for cb in list(self.listeners):
+            cb(self.data, time.time_ns(), seq)
+
+    def read_latest_tactile(self, max_age_ms=None) -> np.ndarray:
+        if self.fail_reads:
+            raise TimeoutError("stale")
         return self.data.copy()
+
+
+@pytest.fixture
+def stub_arm(monkeypatch: pytest.MonkeyPatch):
+    """Replace the SO follower arm with an in-memory stub (no serial bus)."""
+    base = SOTactileFollower.__mro__[1]
+    state = {"arm_disconnects": 0}
+
+    def fake_init(self, cfg):
+        self.config = cfg
+        self.bus = MagicMock(motors={f"j{i}": i for i in range(6)}, is_connected=False)
+        self.cameras = {}
+
+    def fake_connect(self, calibrate=True):
+        self.bus.is_connected = True
+
+    def fake_disconnect(self):
+        if not self.is_connected:  # mirrors upstream @check_if_not_connected
+            raise RuntimeError("parent refused: not connected")
+        self.bus.is_connected = False
+        state["arm_disconnects"] += 1
+
+    monkeypatch.setattr(base, "__init__", fake_init)
+    monkeypatch.setattr(base, "connect", fake_connect)
+    monkeypatch.setattr(base, "disconnect", fake_disconnect)
+    monkeypatch.setattr(base, "get_observation", lambda self: {f"j{i}.pos": float(i) for i in range(6)})
+    monkeypatch.setattr(base, "is_connected", property(lambda self: bool(self.bus.is_connected)))
+    return state
+
+
+def _robot(sensor, **entry_kwargs):
+    cfg = SOTactileFollowerConfig(
+        port="/dev/ttyACM0",
+        tactile_sensors={"primary": FlexiTacSensorEntryConfig(port="/dev/ttyUSB0", **entry_kwargs)},
+    )
+    return SOTactileFollower(cfg, tactile_factory=lambda _n, _c: sensor)
 
 
 def test_robot_config_registration_and_naming_convention():
@@ -45,86 +95,70 @@ def test_robot_config_registration_and_naming_convention():
 
 
 def test_flatten_and_unflatten_c_order_roundtrip():
-    shape = (12, 32)
-    names_joint = [f"joint_{i}.pos" for i in range(6)]
-    names_tactile = flatten_tactile_names("primary", shape)
-    assert len(names_tactile) == 384
-    assert names_tactile[0] == "tactile.primary.r00_c00"
-    assert names_tactile[-1] == "tactile.primary.r11_c31"
+    names = [f"j{i}.pos" for i in range(6)] + flatten_tactile_names("primary", SHAPE)
+    assert names[6] == "tactile.primary.r00_c00" and names[-1] == "tactile.primary.r11_c31"
 
-    all_names = names_joint + names_tactile
     rng = np.random.default_rng(7)
-    joints = rng.normal(size=(4, 6)).astype(np.float32)
-    tactile_maps = rng.uniform(0.0, 1.0, size=(4, 12, 32)).astype(np.float32)
-    state_batch = np.concatenate([joints, tactile_maps.reshape(4, 384)], axis=-1)
-
-    recovered = unflatten_tactile_state(all_names, state_batch, sensor_name="primary", shape=shape)
-    assert recovered.shape == (4, 12, 32)
-    np.testing.assert_allclose(recovered, tactile_maps, atol=1e-7)
+    maps = rng.uniform(0.0, 1.0, size=(4, *SHAPE)).astype(np.float32)
+    state = np.concatenate([rng.normal(size=(4, 6)).astype(np.float32), maps.reshape(4, -1)], axis=-1)
+    np.testing.assert_allclose(unflatten_tactile_state(names, state, "primary", SHAPE), maps)
 
 
-def test_observation_features_and_fault_tolerant_get_observation(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    # Stub out parent SOFollower __init__, connect, get_observation, disconnect so no serial arm is needed
-    base_cls = SOTactileFollower.__mro__[1]
-    monkeypatch.setattr(
-        base_cls,
-        "__init__",
-        lambda self, cfg: (
-            setattr(self, "config", cfg),
-            setattr(self, "bus", MagicMock(motors={f"j{i}": i for i in range(6)}, is_connected=True)),
-            setattr(self, "cameras", {}),
-        ),
-    )
-    monkeypatch.setattr(base_cls, "connect", lambda self, calibrate=True: None)
-    monkeypatch.setattr(
-        base_cls,
-        "get_observation",
-        lambda self: {f"j{i}.pos": float(i) for i in range(6)},
-    )
-    monkeypatch.setattr(base_cls, "disconnect", lambda self: None)
-
-    fake_sensor = _FakeTactileSensor((12, 32))
-    cfg = SOTactileFollowerConfig(
-        port="/dev/ttyACM0",
-        tactile_sensors={
-            "primary": FlexiTacSensorEntryConfig(
-                port="/dev/ttyUSB0",
-                record_raw_csv=True,
-                raw_csv_dir=str(tmp_path / "csv"),
-            )
-        },
-    )
-    robot = SOTactileFollower(cfg, tactile_factory=lambda _n, _c: fake_sensor)
-
-    # observation_features MUST work before connect() (as lerobot-record requires)
-    assert not fake_sensor.is_connected
-    ft = robot.observation_features
-    assert len(ft) == 6 + 384
-    assert ft["j0.pos"] is float
-    assert ft["tactile.primary.r00_c00"] is float
+def test_features_before_connect_and_observation_values(stub_arm):
+    sensor = _FakeTactileSensor()
+    robot = _robot(sensor)
+    ft = robot.observation_features  # must work before connect() (lerobot-record order)
+    assert len(ft) == 6 + 384 and ft["tactile.primary.r00_c00"] is float
 
     robot.connect(calibrate=False)
-    assert fake_sensor.is_connected
+    assert robot.is_connected
+    obs = robot.get_observation()
+    keys = list(ft)
+    state = np.array([obs[k] for k in keys], dtype=np.float32)
+    np.testing.assert_allclose(unflatten_tactile_state(keys, state, "primary", SHAPE), sensor.data)
 
-    obs_ok = robot.get_observation()
-    assert len(obs_ok) == 390
-    state_keys = list(ft.keys())
-    state_vec = np.array([obs_ok[k] for k in state_keys], dtype=np.float32)
-    np.testing.assert_allclose(
-        unflatten_tactile_state(state_keys, state_vec, "primary", (12, 32)),
-        fake_sensor.data,
-    )
-
-    # Inject transient sensor failure: must reuse last valid frame instead of zeros!
-    fake_sensor.should_fail = True
-    obs_glitch = robot.get_observation()
-    state_vec_glitch = np.array([obs_glitch[k] for k in state_keys], dtype=np.float32)
-    np.testing.assert_allclose(state_vec_glitch, state_vec)
-
-    # Verify sidecar CSV recorded rows
+    sensor.is_connected = False  # tactile loss is reflected in robot connectivity
+    assert not robot.is_connected
+    sensor.is_connected = True
     robot.disconnect()
-    assert not fake_sensor.is_connected
-    csv_path = tmp_path / "csv" / "flexitac_primary.csv"
-    assert csv_path.is_file()
-    lines = csv_path.read_text(encoding="utf-8").strip().splitlines()
-    assert len(lines) == 3  # header + 2 observations
+    assert stub_arm["arm_disconnects"] == 1 and not sensor.is_connected
+
+
+def test_stale_tactile_is_bridged_briefly_then_raises(stub_arm):
+    sensor = _FakeTactileSensor()
+    robot = _robot(sensor, stale_timeout_s=0.1)
+    robot.connect(calibrate=False)
+    good = robot.get_observation()
+
+    sensor.fail_reads = True
+    bridged = robot.get_observation()  # within stale_timeout: reuse last valid frame
+    assert bridged == good
+
+    time.sleep(0.15)
+    with pytest.raises(RuntimeError, match="no fresh frame"):
+        robot.get_observation()
+    robot.disconnect()
+
+
+def test_connect_rolls_back_arm_when_tactile_fails(stub_arm):
+    sensor = _FakeTactileSensor(fail_connect=True)
+    robot = _robot(sensor)
+    with pytest.raises(TimeoutError):
+        robot.connect(calibrate=False)
+    assert stub_arm["arm_disconnects"] == 1
+    assert not robot.bus.is_connected and not sensor.is_connected
+
+
+def test_full_rate_csv_sidecar(stub_arm, tmp_path: Path):
+    sensor = _FakeTactileSensor()
+    robot = _robot(sensor, record_raw_csv=True, raw_csv_dir=str(tmp_path), csv_flush_every=2)
+    robot.connect(calibrate=False)
+    for seq in range(1, 6):  # 5 sensor frames, independent of observation rate
+        sensor.emit(seq)
+    robot.disconnect()
+    assert sensor.listeners == []
+
+    lines = (tmp_path / "flexitac_primary.csv").read_text(encoding="utf-8").strip().splitlines()
+    assert lines[0].startswith("epoch_ns,seq,tactile.primary.r00_c00")
+    assert len(lines) == 1 + 5
+    assert [int(line.split(",")[1]) for line in lines[1:]] == [1, 2, 3, 4, 5]

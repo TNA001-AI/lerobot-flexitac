@@ -1,13 +1,23 @@
-"""FlexiTac (12x32) tactile sensor implementation for LeRobot."""
+"""FlexiTac (12x32) tactile sensor implementation for LeRobot.
+
+Threading model: exactly one reader owns the serial port. In the default backend this is a
+daemon thread; with ``process_backend=True`` it is a spawned child process that writes into
+shared memory, mirrored into the parent by a light sync thread. Every public read API is
+served from the latest ingested frame, so callers never touch the serial port concurrently.
+"""
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import multiprocessing as mp
-from multiprocessing import shared_memory
+import queue
 import threading
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from multiprocessing import shared_memory
+from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -18,6 +28,54 @@ from .config_flexitac_tactile import FlexiTacTactileConfig
 
 logger = logging.getLogger(__name__)
 
+# (tactile_map, epoch_ns, seq) -> None. Called from the reader / sync thread for every frame.
+FrameListener = Callable[[NDArray[np.float32], int, int], None]
+
+_WARN_INTERVAL_S = 5.0
+
+
+class TactileShapeError(ValueError):
+    """Raised when the sensor delivers a frame whose shape differs from ``tactile_shape``."""
+
+
+def make_flexitac_sensor(cfg: Any) -> Any:
+    """Build a ``flexitac.FlexiTacSensor`` (not opened) from a config-like object.
+
+    Module-level so it can be pickled into the ``process_backend`` worker.
+    """
+    from flexitac import FlexiTacSensor
+
+    rows, cols = cfg.tactile_shape
+    return FlexiTacSensor(
+        cfg.port,
+        rows=rows,
+        cols=cols,
+        baud=cfg.baud_rate,
+        threshold=cfg.threshold,
+        noise_scale=cfg.noise_scale,
+        init_frames=cfg.init_frames,
+        read_timeout_s=cfg.read_timeout_s,
+        baseline=cfg.baseline,
+    )
+
+
+def frame_to_tactile_map(frame: Any, sensor: Any, cfg: Any) -> NDArray[np.float32]:
+    """Convert a ``flexitac.FlexiTacFrame`` to a ``(rows, cols)`` float32 map in ``[0, 1]``."""
+    if cfg.signal == "baseline_subtracted":
+        baseline = getattr(sensor, "baseline", None)
+        if baseline is None:
+            raise RuntimeError("signal='baseline_subtracted' requires a calibrated sensor baseline")
+        signal = np.asarray(frame.raw, dtype=np.float32) - np.asarray(baseline, dtype=np.float32)
+        # Same clipping range flexitac uses internally (0..100 ADC counts above threshold).
+        data = np.clip(signal - float(cfg.threshold), 0.0, 100.0) / 100.0
+    else:
+        data = np.asarray(frame.normalized, dtype=np.float32)
+
+    data = np.ascontiguousarray(data, dtype=np.float32)
+    if data.shape != tuple(cfg.tactile_shape):
+        raise TactileShapeError(f"expected tactile shape {tuple(cfg.tactile_shape)}, got {data.shape}")
+    return data
+
 
 def encode_tactile_map(
     tactile: NDArray[np.floating[Any]],
@@ -26,12 +84,11 @@ def encode_tactile_map(
     width: int | None = None,
     height: int | None = None,
 ) -> NDArray[np.uint8]:
-    """Encode a 2D normalized ``[0, 1]`` tactile array into an ``(H, W, 3)`` ``uint8`` image.
+    """Encode a 2D ``[0, 1]`` tactile map into an ``(H, W, 3)`` ``uint8`` image.
 
-    - ``render="raw"``: Reversibly maps ``[0, 1]`` to ``[0, 255]`` replicated across 3 channels.
-      Uses nearest-neighbor resize when ``(width, height)`` differs from ``(cols, rows)`` so
-      block centers retain exact quantized values.
-    - ``render="heatmap"``: Applies OpenCV Viridis colormap (converted to RGB).
+    - ``render="raw"``: reversible, ``[0, 1] -> [0, 255]`` replicated across 3 channels.
+      Resizing uses nearest-neighbor so block centers keep the exact quantized value.
+    - ``render="heatmap"``: OpenCV Viridis colormap converted to RGB (not invertible).
     """
     arr = np.clip(np.asarray(tactile, dtype=np.float32), 0.0, 1.0)
     if arr.ndim != 2:
@@ -40,7 +97,6 @@ def encode_tactile_map(
     rows, cols = arr.shape
     target_w = cols if width is None else int(width)
     target_h = rows if height is None else int(height)
-
     scaled = np.rint(arr * 255.0).astype(np.uint8)
 
     if render == "raw":
@@ -48,8 +104,7 @@ def encode_tactile_map(
     elif render == "heatmap":
         import cv2
 
-        bgr = cv2.applyColorMap(scaled, cv2.COLORMAP_VIRIDIS)
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        rgb = cv2.cvtColor(cv2.applyColorMap(scaled, cv2.COLORMAP_VIRIDIS), cv2.COLOR_BGR2RGB)
     else:
         raise ValueError(f"Unknown render mode {render!r}. Expected 'raw' or 'heatmap'.")
 
@@ -57,7 +112,6 @@ def encode_tactile_map(
         import cv2
 
         rgb = cv2.resize(rgb, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
-
     return rgb
 
 
@@ -65,394 +119,463 @@ def decode_tactile_image(
     image: NDArray[np.uint8],
     tactile_shape: tuple[int, int] = (12, 32),
 ) -> NDArray[np.float32]:
-    """Invert ``encode_tactile_map(..., render='raw')`` back to a ``(rows, cols)`` ``float32`` map in ``[0, 1]``."""
+    """Invert ``encode_tactile_map(..., render='raw')`` back to ``(rows, cols)`` float32."""
     img = np.asarray(image)
     if img.ndim != 3 or img.shape[2] != 3:
         raise ValueError(f"Expected (H, W, 3) uint8 image, got shape {img.shape}")
 
     rows, cols = tactile_shape
-    gray = img.mean(axis=2)
+    gray = img.astype(np.float32).mean(axis=2)
     h, w = gray.shape
     if (h, w) != (rows, cols):
-        # Sample block centers corresponding to nearest-neighbor upscale
         row_idx = ((np.arange(rows) + 0.5) * h / rows).astype(int).clip(0, h - 1)
         col_idx = ((np.arange(cols) + 0.5) * w / cols).astype(int).clip(0, w - 1)
         gray = gray[np.ix_(row_idx, col_idx)]
-
     return (gray / 255.0).astype(np.float32)
 
 
-def _flexitac_process_worker(
+def _process_worker(
+    sensor_factory: Callable[[Any], Any],
     cfg_dict: dict[str, Any],
     shm_name: str,
-    meta_shm_name: str,
+    meta_name: str,
+    lock: Any,
     ready_evt: Any,
     stop_evt: Any,
-    error_queue: Any,
+    err_q: Any,
 ) -> None:
-    """Isolated child-process serial reader writing latest float32 frame into shared memory."""
-    shm = None
-    meta_shm = None
-    sensor = None
+    """Child process: own the serial port and publish frames into shared memory.
+
+    Shared layout: ``buf`` float32 ``(rows, cols)``; ``meta`` int64 ``[seq, monotonic_ns,
+    epoch_ns]``. Both are only touched while holding ``lock`` so reads are never torn.
+    """
+    cfg = SimpleNamespace(**cfg_dict)
+    rows, cols = cfg.tactile_shape
+    shm = meta_shm = sensor = None
+
+    def _report(msg: str) -> None:
+        try:
+            err_q.put_nowait(msg)
+        except Exception:  # nosec B110 - best-effort error reporting
+            pass
+
     try:
-        from flexitac import FlexiTacSensor
-
-        rows, cols = cfg_dict["tactile_shape"]
         shm = shared_memory.SharedMemory(name=shm_name)
-        meta_shm = shared_memory.SharedMemory(name=meta_shm_name)
+        meta_shm = shared_memory.SharedMemory(name=meta_name)
         buf = np.ndarray((rows, cols), dtype=np.float32, buffer=shm.buf)
-        # meta: [frame_counter, monotonic_timestamp_s]
-        meta = np.ndarray((2,), dtype=np.float64, buffer=meta_shm.buf)
+        meta = np.ndarray((3,), dtype=np.int64, buffer=meta_shm.buf)
 
-        sensor = FlexiTacSensor(
-            cfg_dict["port"],
-            rows=rows,
-            cols=cols,
-            baud=cfg_dict["baud_rate"],
-            threshold=cfg_dict["threshold"],
-            noise_scale=cfg_dict["noise_scale"],
-            init_frames=cfg_dict["init_frames"],
-            baseline=cfg_dict["baseline"],
-        )
+        sensor = sensor_factory(cfg)
         sensor.open()
-
-        seq = 0.0
+        seq = 0
+        last_report = 0.0
         while not stop_evt.is_set():
             try:
-                frame = sensor.read_latest()
-                data = np.asarray(frame.normalized, dtype=np.float32)
+                data = frame_to_tactile_map(sensor.read_latest(), sensor, cfg)
+            except TactileShapeError:
+                raise
+            except Exception as exc:
+                now = time.monotonic()
+                if now - last_report > _WARN_INTERVAL_S:
+                    _report(f"transient: {exc!r}")
+                    last_report = now
+                time.sleep(0.05)
+                continue
+            seq += 1
+            with lock:
                 buf[:] = data
-                seq += 1.0
                 meta[0] = seq
-                meta[1] = time.monotonic()
-                if not ready_evt.is_set():
-                    ready_evt.set()
-            except Exception:
-                time.sleep(0.002)
+                meta[1] = time.monotonic_ns()
+                meta[2] = time.time_ns()
+            ready_evt.set()
     except Exception as exc:
-        try:
-            error_queue.put_nowait(repr(exc))
-        except Exception:
-            pass
+        _report(f"fatal: {exc!r}")
     finally:
         if sensor is not None:
             try:
                 sensor.close()
-            except Exception:
+            except Exception:  # nosec B110
                 pass
-        if shm is not None:
-            shm.close()
-        if meta_shm is not None:
-            meta_shm.close()
+        for s in (shm, meta_shm):
+            if s is not None:
+                s.close()
 
 
 class FlexiTacTactile(_StreamSensor):
     """LeRobot tactile stream device for FlexiTac (12x32) tactile pads.
 
-    Supports both:
-    1. Direct lossless ``float32`` tactile matrix reads via :meth:`read_latest_tactile`.
-    2. Standard ``(H, W, 3)`` ``uint8`` stream reads (:meth:`read`, :meth:`async_read`,
-       :meth:`read_latest`) for zero-change compatibility with ``lerobot-record`` and Rerun.
+    Two access paths:
+    1. :meth:`read_latest_tactile` returns the exact ``(rows, cols)`` float32 map (used by
+       ``lerobot_robot_so_flexitac``).
+    2. The standard stream API (:meth:`read`, :meth:`async_read`, :meth:`read_latest`)
+       returns ``(H, W, 3)`` uint8 so stock ``lerobot-record`` and Rerun work unchanged.
+
+    Staleness is never hidden: if no fresh frame arrives, :meth:`read_latest` /
+    :meth:`read_latest_tactile` raise ``TimeoutError`` once ``max_age_ms`` is exceeded, and
+    :meth:`async_read` raises ``TimeoutError`` instead of repeating an old frame.
     """
 
     def __init__(
         self,
         config: FlexiTacTactileConfig,
         *,
-        sensor_factory: Callable[..., Any] | None = None,
+        sensor_factory: Callable[[Any], Any] | None = None,
     ):
+        self._connected = False
         super().__init__(config)
         self.config: FlexiTacTactileConfig = config
         self.rows, self.cols = config.tactile_shape
-        self._sensor_factory = sensor_factory
 
-        if self._sensor_factory is None and not config.process_backend:
-            try:
-                import flexitac  # noqa: F401
-            except ImportError as e:
-                raise ImportError(
-                    "The 'flexitac' driver package is required to use FlexiTacTactile. "
-                    "Install it with: pip install flexitac"
-                ) from e
+        if sensor_factory is None and importlib.util.find_spec("flexitac") is None:
+            raise ImportError(
+                "The 'flexitac' driver package is required to use FlexiTacTactile. "
+                "Install it with: pip install flexitac"
+            )
+        self._sensor_factory: Callable[[Any], Any] = sensor_factory or make_flexitac_sensor
 
         self._sensor: Any = None
-        self._connected = False
-
-        # Threading & fault-tolerant frame cache
-        self._lock = threading.Lock()
-        self._new_frame_evt = threading.Event()
+        self._cond = threading.Condition()
         self._stop_evt = threading.Event()
         self._thread: threading.Thread | None = None
-        self._last_valid_tactile: NDArray[np.float32] | None = None
-        self._prev_filtered: NDArray[np.float32] | None = None
-        self._latest_ts: float = 0.0
+        self._listeners: list[FrameListener] = []
+        self.last_error: str | None = None
+        self._last_warn = 0.0
+        self._reset_frame_state()
 
-        # Multiprocessing + shared memory handles
+        # process backend handles
         self._shm: shared_memory.SharedMemory | None = None
         self._meta_shm: shared_memory.SharedMemory | None = None
-        self._proc: mp.Process | None = None
-        self._proc_stop_evt: Any = None
-        self._last_consumed_seq: float = 0.0
+        self._shm_buf: NDArray[np.float32] | None = None
+        self._shm_meta: NDArray[np.int64] | None = None
+        self._shm_seen_seq = 0
+        self._proc: Any = None
+        self._proc_stop: Any = None
+        self._proc_lock: Any = None
+        self._proc_ready: Any = None
+        self._err_q: Any = None
+        self._worker_dead_logged = False
 
     def __str__(self) -> str:
         return f"FlexiTacTactile(port={self.config.port!r}, shape={self.config.tactile_shape})"
+
+    # ---- state -------------------------------------------------------------
+
+    def _reset_frame_state(self) -> None:
+        with self._cond:
+            self._latest: NDArray[np.float32] | None = None
+            self._filtered: NDArray[np.float32] | None = None
+            self._latest_mono = 0.0
+            self._seq = 0
+            self._consumed_seq = 0
 
     @property
     def is_connected(self) -> bool:
         return self._connected
 
+    @property
+    def frame_count(self) -> int:
+        """Number of frames ingested since the last ``connect()``."""
+        return self._seq
+
+    def latest_frame_age_ms(self) -> float | None:
+        with self._cond:
+            if self._latest is None:
+                return None
+            return (time.monotonic() - self._latest_mono) * 1000.0
+
+    def add_frame_listener(self, listener: FrameListener) -> None:
+        """Register ``listener(tactile_map, epoch_ns, seq)`` called for every ingested frame."""
+        with self._cond:
+            self._listeners.append(listener)
+
+    def remove_frame_listener(self, listener: FrameListener) -> None:
+        with self._cond:
+            if listener in self._listeners:
+                self._listeners.remove(listener)
+
+    def _ingest(self, data: NDArray[np.float32], mono_s: float, epoch_ns: int) -> None:
+        alpha = self.config.temporal_alpha
+        with self._cond:
+            self._latest = data
+            # EMA advances once per sensor frame, independent of how often callers read.
+            self._filtered = data.copy() if self._filtered is None else alpha * data + (1.0 - alpha) * self._filtered
+            self._latest_mono = mono_s
+            self._seq += 1
+            seq = self._seq
+            listeners = list(self._listeners)
+            self._cond.notify_all()
+        for listener in listeners:
+            try:
+                listener(data, epoch_ns, seq)
+            except Exception:
+                logger.exception(f"{self}: frame listener raised")
+
+    def _warn_throttled(self, msg: str) -> None:
+        now = time.monotonic()
+        if now - self._last_warn > _WARN_INTERVAL_S:
+            logger.warning(msg)
+            self._last_warn = now
+
+    # ---- discovery -----------------------------------------------------------
+
     @staticmethod
     def find_cameras() -> list[dict[str, Any]]:
-        """List available serial ports that may host FlexiTac boards."""
+        """List serial ports that could host a FlexiTac board.
+
+        FlexiTac boards expose no identifying USB descriptor, so this returns every serial
+        port (including robot arm buses). Use ``flexitac-find-port`` (unplug/replug) to
+        identify the right one.
+        """
         try:
             from serial.tools import list_ports
         except ImportError:
             return []
         return [
-            {"type": "flexitac", "port": p.device, "description": p.description}
+            {
+                "type": "flexitac",
+                "port": p.device,
+                "description": p.description,
+                "hwid": p.hwid,
+                "vid": p.vid,
+                "pid": p.pid,
+            }
             for p in list_ports.comports()
         ]
 
-    # ---- Lossless float32 tactile API ------------------------------------
-
-    def read_latest_tactile(self, max_age_ms: int | None = None) -> NDArray[np.float32]:
-        """Return the freshest ``(rows, cols)`` ``float32`` tactile map.
-
-        On transient read glitches, returns the last valid frame instead of zeros so
-        downstream policies do not mistake a dropped packet for contact release.
-        """
-        if not self._connected:
-            raise ConnectionError(f"{self} is not connected.")
-
-        if self.config.process_backend and self._shm is not None and self._meta_shm is not None:
-            meta = np.ndarray((2,), dtype=np.float64, buffer=self._meta_shm.buf)
-            seq, ts = float(meta[0]), float(meta[1])
-            if seq == 0.0:
-                return np.zeros((self.rows, self.cols), dtype=np.float32)
-            if max_age_ms is not None and (time.monotonic() - ts) * 1000.0 > max_age_ms:
-                raise TimeoutError(f"{self}: latest shared-memory tactile frame exceeded {max_age_ms}ms")
-            buf = np.ndarray((self.rows, self.cols), dtype=np.float32, buffer=self._shm.buf)
-            frame = buf.copy()
-            self._last_valid_tactile = frame
-            return frame
-
-        with self._lock:
-            if self._last_valid_tactile is None:
-                return np.zeros((self.rows, self.cols), dtype=np.float32)
-            if max_age_ms is not None and self._latest_ts > 0.0:
-                age_ms = (time.monotonic() - self._latest_ts) * 1000.0
-                if age_ms > max_age_ms:
-                    raise TimeoutError(f"{self}: latest tactile frame is stale ({age_ms:.1f}ms > {max_age_ms}ms)")
-            return self._last_valid_tactile.copy()
-
-    # ---- Rendering & background reader -----------------------------------
-
-    def _render_frame(self, raw: NDArray[np.float32]) -> NDArray[np.uint8]:
-        if self.config.render == "heatmap":
-            alpha = self.config.temporal_alpha
-            if self._prev_filtered is None:
-                self._prev_filtered = raw.copy()
-            else:
-                self._prev_filtered = alpha * raw + (1.0 - alpha) * self._prev_filtered
-            to_encode = self._prev_filtered
-        else:
-            # Keep "raw" free of temporal blending unless alpha < 1 is desired?
-            # Preserve exact single-frame taxel values in "raw" mode for invertibility.
-            to_encode = raw
-
-        return encode_tactile_map(
-            to_encode,
-            render=self.config.render,
-            width=self.width,
-            height=self.height,
-        )
-
-    def _poll_once(self) -> NDArray[np.float32]:
-        frame = self._sensor.read_latest()
-        data = np.asarray(frame.normalized, dtype=np.float32)
-        if data.shape != (self.rows, self.cols):
-            raise ValueError(
-                f"{self}: expected tactile shape {(self.rows, self.cols)}, got {data.shape}"
-            )
-        return data
+    # ---- reader loops --------------------------------------------------------
 
     def _thread_read_loop(self) -> None:
         while not self._stop_evt.is_set():
             try:
-                data = self._poll_once()
-                with self._lock:
-                    self._last_valid_tactile = data
-                    self._latest_ts = time.monotonic()
-                self._new_frame_evt.set()
-            except ValueError:
-                logger.exception(f"{self}: fatal tactile shape mismatch; stopping reader")
-                break
+                data = frame_to_tactile_map(self._sensor.read_latest(), self._sensor, self.config)
+            except TactileShapeError as exc:
+                self.last_error = repr(exc)
+                logger.error(f"{self}: {exc}; stopping reader (schema mismatch is not recoverable)")
+                return
             except Exception as exc:
-                logger.warning(f"{self}: transient read error ({exc}); retaining last valid frame")
-                time.sleep(0.005)
+                self.last_error = repr(exc)
+                self._warn_throttled(f"{self}: transient read error: {exc!r}")
+                time.sleep(0.05)
+                continue
+            self._ingest(data, time.monotonic(), time.time_ns())
 
-    # ---- Lifecycle & Camera-compatible stream API ------------------------
+    def _drain_worker_errors(self) -> None:
+        if self._err_q is None:
+            return
+        while True:
+            try:
+                msg = self._err_q.get_nowait()
+            except (queue.Empty, OSError, ValueError, EOFError):
+                return
+            self.last_error = msg
+            self._warn_throttled(f"{self}: worker reported {msg}")
+
+    def _sync_from_shm(self) -> None:
+        if self._shm_meta is None or self._shm_buf is None:
+            return
+        with self._proc_lock:
+            seq = int(self._shm_meta[0])
+            if seq <= self._shm_seen_seq:
+                return
+            data = self._shm_buf.copy()
+            mono_ns = int(self._shm_meta[1])
+            epoch_ns = int(self._shm_meta[2])
+        self._shm_seen_seq = seq
+        self._ingest(data, mono_ns / 1e9, epoch_ns)
+
+    def _process_sync_loop(self) -> None:
+        while not self._stop_evt.is_set():
+            self._drain_worker_errors()
+            self._sync_from_shm()
+            if self._proc is not None and not self._proc.is_alive() and not self._worker_dead_logged:
+                self._worker_dead_logged = True
+                logger.error(f"{self}: reader process exited (last error: {self.last_error})")
+            time.sleep(0.001)
+
+    # ---- lifecycle -------------------------------------------------------------
 
     def connect(self, warmup: bool = True) -> None:
         if self._connected:
             raise RuntimeError(f"{self} is already connected.")
-
-        if self.config.process_backend:
-            self._connect_process_backend(warmup=warmup)
-            return
-
-        if self._sensor_factory is not None:
-            self._sensor = self._sensor_factory(self.config)
-        else:
-            from flexitac import FlexiTacSensor
-
-            self._sensor = FlexiTacSensor(
-                self.config.port,
-                rows=self.rows,
-                cols=self.cols,
-                baud=self.config.baud_rate,
-                threshold=self.config.threshold,
-                noise_scale=self.config.noise_scale,
-                init_frames=self.config.init_frames,
-                baseline=self.config.baseline,
-            )
-
-        self._sensor.open()
-        self._connected = True
+        self._reset_frame_state()
+        self.last_error = None
         self._stop_evt.clear()
-        self._new_frame_evt.clear()
-        self._thread = threading.Thread(target=self._thread_read_loop, daemon=True)
-        self._thread.start()
 
-        if warmup:
-            if not self._new_frame_evt.wait(timeout=5.0):
-                self.disconnect()
-                raise TimeoutError(f"Timed out waiting for warmup frame from {self}")
-        logger.info(f"{self} connected (thread backend, render={self.config.render}).")
+        try:
+            if self.config.process_backend:
+                self._start_process_backend()
+                timeout_s = self.config.process_connect_timeout_s
+            else:
+                self._sensor = self._sensor_factory(self.config)
+                self._sensor.open()
+                self._thread = threading.Thread(target=self._thread_read_loop, name=f"{self}-reader", daemon=True)
+                self._thread.start()
+                timeout_s = self.config.warmup_timeout_s
+            self._connected = True
 
-    def _connect_process_backend(self, warmup: bool = True) -> None:
-        ctx = mp.get_context("spawn")
-        nbytes = self.rows * self.cols * np.dtype(np.float32).itemsize
-        self._shm = shared_memory.SharedMemory(create=True, size=nbytes)
-        self._meta_shm = shared_memory.SharedMemory(
-            create=True, size=2 * np.dtype(np.float64).itemsize
+            if warmup and not self._wait_for_frame_after(0, timeout_s):
+                raise TimeoutError(
+                    f"Timed out after {timeout_s:.1f}s waiting for the first frame from {self} "
+                    f"(last error: {self.last_error})"
+                )
+        except BaseException:
+            self.disconnect()
+            raise
+        logger.info(
+            f"{self} connected ({'process' if self.config.process_backend else 'thread'} backend, "
+            f"signal={self.config.signal}, render={self.config.render})."
         )
-        np.ndarray((2,), dtype=np.float64, buffer=self._meta_shm.buf)[:] = 0.0
 
-        ready_evt = ctx.Event()
-        self._proc_stop_evt = ctx.Event()
-        err_q = ctx.Queue()
+    def _start_process_backend(self) -> None:
+        ctx = mp.get_context("spawn")
+        self._shm = shared_memory.SharedMemory(create=True, size=self.rows * self.cols * 4)
+        self._meta_shm = shared_memory.SharedMemory(create=True, size=3 * 8)
+        self._shm_buf = np.ndarray((self.rows, self.cols), dtype=np.float32, buffer=self._shm.buf)
+        self._shm_meta = np.ndarray((3,), dtype=np.int64, buffer=self._meta_shm.buf)
+        self._shm_meta[:] = 0
+        self._shm_seen_seq = 0
+        self._worker_dead_logged = False
+
+        # Keep references to every sync primitive passed to the child: if one is garbage
+        # collected before the spawned child unpickles it, its semaphore is unlinked.
+        self._proc_lock = ctx.Lock()
+        self._proc_stop = ctx.Event()
+        self._proc_ready = ctx.Event()
+        self._err_q = ctx.Queue()
         cfg_dict = {
-            "port": self.config.port,
-            "baud_rate": self.config.baud_rate,
-            "tactile_shape": self.config.tactile_shape,
-            "baseline": self.config.baseline,
-            "init_frames": self.config.init_frames,
-            "threshold": self.config.threshold,
-            "noise_scale": self.config.noise_scale,
+            name: getattr(self.config, name)
+            for name in (
+                "port",
+                "baud_rate",
+                "tactile_shape",
+                "baseline",
+                "init_frames",
+                "threshold",
+                "noise_scale",
+                "read_timeout_s",
+                "signal",
+            )
         }
         self._proc = ctx.Process(
-            target=_flexitac_process_worker,
-            args=(cfg_dict, self._shm.name, self._meta_shm.name, ready_evt, self._proc_stop_evt, err_q),
+            target=_process_worker,
+            args=(
+                self._sensor_factory,
+                cfg_dict,
+                self._shm.name,
+                self._meta_shm.name,
+                self._proc_lock,
+                self._proc_ready,
+                self._proc_stop,
+                self._err_q,
+            ),
+            name=f"{self}-worker",
             daemon=True,
         )
         self._proc.start()
-        self._connected = True
-
-        if warmup:
-            if not ready_evt.wait(timeout=self.config.process_connect_timeout_s):
-                worker_err = None
-                try:
-                    worker_err = err_q.get_nowait()
-                except Exception:
-                    pass
-                self.disconnect()
-                detail = f" (worker error: {worker_err})" if worker_err else ""
-                raise TimeoutError(
-                    f"Timed out waiting for process backend on {self}{detail}"
-                )
-        logger.info(f"{self} connected (process backend, render={self.config.render}).")
-
-    def read(self) -> NDArray[np.uint8]:
-        if not self._connected:
-            raise ConnectionError(f"{self} is not connected.")
-        if self.config.process_backend:
-            return self._render_frame(self.read_latest_tactile())
-
-        try:
-            data = self._poll_once()
-            with self._lock:
-                self._last_valid_tactile = data
-                self._latest_ts = time.monotonic()
-        except Exception as exc:
-            logger.warning(f"{self}: synchronous read fallback to last valid frame ({exc})")
-            data = self.read_latest_tactile()
-        return self._render_frame(data)
-
-    def async_read(self, timeout_ms: float = 200) -> NDArray[np.uint8]:
-        if not self._connected:
-            raise ConnectionError(f"{self} is not connected.")
-
-        if self.config.process_backend and self._meta_shm is not None:
-            deadline = time.monotonic() + timeout_ms / 1000.0
-            meta = np.ndarray((2,), dtype=np.float64, buffer=self._meta_shm.buf)
-            while float(meta[0]) <= self._last_consumed_seq:
-                if time.monotonic() >= deadline:
-                    if self._last_valid_tactile is not None:
-                        return self._render_frame(self._last_valid_tactile)
-                    raise TimeoutError(f"{self}: no new frame within {timeout_ms}ms")
-                time.sleep(0.001)
-            self._last_consumed_seq = float(meta[0])
-            return self._render_frame(self.read_latest_tactile())
-
-        if not self._new_frame_evt.wait(timeout=timeout_ms / 1000.0):
-            with self._lock:
-                if self._last_valid_tactile is None:
-                    raise TimeoutError(f"{self}: no tactile frame received within {timeout_ms}ms")
-                fallback = self._last_valid_tactile.copy()
-            return self._render_frame(fallback)
-
-        self._new_frame_evt.clear()
-        return self._render_frame(self.read_latest_tactile())
-
-    def read_latest(self, max_age_ms: int = 500) -> NDArray[np.uint8]:
-        raw = self.read_latest_tactile(max_age_ms=max_age_ms)
-        return self._render_frame(raw)
+        self._thread = threading.Thread(target=self._process_sync_loop, name=f"{self}-sync", daemon=True)
+        self._thread.start()
 
     def disconnect(self) -> None:
-        if self.config.process_backend:
-            if self._proc_stop_evt is not None:
-                self._proc_stop_evt.set()
-            if self._proc is not None and self._proc.is_alive():
-                self._proc.join(timeout=2.0)
-                if self._proc.is_alive():
-                    self._proc.terminate()
-            for shm_obj in (self._shm, self._meta_shm):
-                if shm_obj is not None:
-                    try:
-                        shm_obj.close()
-                    except Exception:
-                        pass
-                    try:
-                        shm_obj.unlink()
-                    except Exception:
-                        pass
-            self._shm = None
-            self._meta_shm = None
-            self._proc = None
-            self._connected = False
-            logger.info(f"{self} disconnected (process backend).")
-            return
-
         self._stop_evt.set()
+        if self._proc_stop is not None:
+            self._proc_stop.set()
         if self._thread is not None and self._thread.is_alive():
-            self._thread.join(timeout=1.0)
+            self._thread.join(timeout=2.0)
         self._thread = None
+
+        if self._proc is not None:
+            self._proc.join(timeout=3.0)
+            if self._proc.is_alive():
+                self._proc.terminate()
+                self._proc.join(timeout=1.0)
+        self._proc = None
+
         if self._sensor is not None:
             try:
                 self._sensor.close()
             except Exception as exc:
-                logger.warning(f"{self}: error closing serial sensor: {exc}")
+                logger.warning(f"{self}: error closing serial port: {exc!r}")
             self._sensor = None
+
+        self._shm_buf = None
+        self._shm_meta = None
+        for shm_obj in (self._shm, self._meta_shm):
+            if shm_obj is not None:
+                try:
+                    shm_obj.close()
+                    shm_obj.unlink()
+                except (FileNotFoundError, BufferError, OSError) as exc:
+                    logger.debug(f"{self}: shared memory cleanup: {exc!r}")
+        self._shm = self._meta_shm = None
+        if self._err_q is not None:
+            self._err_q.close()
+        self._err_q = self._proc_stop = self._proc_lock = self._proc_ready = None
+
+        was_connected = self._connected
         self._connected = False
-        logger.info(f"{self} disconnected.")
+        if was_connected:
+            logger.info(f"{self} disconnected.")
+
+    # ---- read API ----------------------------------------------------------------
+
+    def _check_connected(self) -> None:
+        if not self._connected:
+            raise ConnectionError(f"{self} is not connected.")
+
+    def _wait_for_frame_after(self, seq: int, timeout_s: float) -> bool:
+        with self._cond:
+            return self._cond.wait_for(lambda: self._seq > seq, timeout=timeout_s)
+
+    def _latest_locked(self, max_age_ms: float | None) -> NDArray[np.float32]:
+        if self._latest is None:
+            raise RuntimeError(f"{self} has not received any frame yet (last error: {self.last_error})")
+        if max_age_ms is not None:
+            age_ms = (time.monotonic() - self._latest_mono) * 1000.0
+            if age_ms > max_age_ms:
+                raise TimeoutError(
+                    f"{self}: latest frame is {age_ms:.0f}ms old (> {max_age_ms}ms, last error: {self.last_error})"
+                )
+        return self._latest
+
+    def _render_locked(self) -> NDArray[np.uint8]:
+        source = self._filtered if self.config.render == "heatmap" else self._latest
+        assert source is not None
+        return encode_tactile_map(source, render=self.config.render, width=self.width, height=self.height)
+
+    def read_latest_tactile(self, max_age_ms: float | None = None) -> NDArray[np.float32]:
+        """Return a copy of the latest ``(rows, cols)`` float32 map.
+
+        Raises ``TimeoutError`` if it is older than ``max_age_ms`` and ``RuntimeError`` if no
+        frame has arrived yet. Pass ``max_age_ms`` in control loops so a dead sensor is
+        detected instead of silently repeating the last frame.
+        """
+        self._check_connected()
+        with self._cond:
+            return self._latest_locked(max_age_ms).copy()
+
+    def read(self) -> NDArray[np.uint8]:
+        """Block until the next new frame arrives and return it rendered."""
+        self._check_connected()
+        with self._cond:
+            start = self._seq
+        timeout_s = self.config.read_timeout_s + 0.5
+        if not self._wait_for_frame_after(start, timeout_s):
+            raise TimeoutError(f"{self}: no new frame within {timeout_s:.1f}s (last error: {self.last_error})")
+        with self._cond:
+            return self._render_locked()
+
+    def async_read(self, timeout_ms: float = 200) -> NDArray[np.uint8]:
+        """Return the latest *unconsumed* frame, waiting up to ``timeout_ms`` for one."""
+        self._check_connected()
+        with self._cond:
+            if not self._cond.wait_for(lambda: self._seq > self._consumed_seq, timeout=timeout_ms / 1000.0):
+                raise TimeoutError(f"{self}: no new frame within {timeout_ms}ms (last error: {self.last_error})")
+            self._consumed_seq = self._seq
+            return self._render_locked()
+
+    def read_latest(self, max_age_ms: int = 500) -> NDArray[np.uint8]:
+        """Return the most recent frame rendered, without waiting (peek)."""
+        self._check_connected()
+        with self._cond:
+            self._latest_locked(max_age_ms)
+            return self._render_locked()
