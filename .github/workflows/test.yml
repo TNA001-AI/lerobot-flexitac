@@ -12,12 +12,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Oldest supported: LeRobot 0.3.x layout (so101_follower, in-policy normalization).
+          # LeRobot 0.3.x: so101_follower layout, in-policy normalization, NO plugin auto-discovery.
           - python-version: "3.11"
-            lerobot: "lerobot==0.3.4"
-          # Latest LeRobot from PyPI (unified so_follower, processor pipelines).
+            lerobot: "lerobot==0.3.3"
+            discovery: false
+          # Oldest release with third-party plugin auto-discovery (unified so_follower, processors).
+          - python-version: "3.11"
+            lerobot: "lerobot==0.4.4"
+            discovery: true
+          # Latest LeRobot on PyPI.
           - python-version: "3.12"
             lerobot: "lerobot"
+            discovery: true
     name: py${{ matrix.python-version }} / ${{ matrix.lerobot }}
     steps:
       - uses: actions/checkout@v4
@@ -28,9 +34,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install "${{ matrix.lerobot }}" pytest opencv-python-headless
-          pip install -e ./lerobot_tactile_flexitac
-          pip install -e ./lerobot_robot_so_flexitac
-          pip install -e ./lerobot_policy_tactile
+          pip install -e ./lerobot-tactile-flexitac
+          pip install -e ./lerobot-robot-so-flexitac
+          pip install -e ./lerobot-policy-tactile
           python -c "import lerobot, flexitac; print('lerobot', __import__('importlib.metadata').metadata.version('lerobot'), '| flexitac', flexitac.__version__)"
       - name: Verify distribution names keep underscores (LeRobot plugin discovery)
         run: |
@@ -41,6 +47,7 @@ jobs:
               assert expected in names, f"{expected} missing from installed distributions"
           print("plugin distributions OK")
           EOF
+      # Runs from the repo root on purpose: guards against project folders shadowing the packages.
       - name: Verify LeRobot auto-discovers and registers the plugins
         run: |
           python - <<'EOF'
@@ -54,6 +61,6 @@ jobs:
           assert "act_tactile" in PreTrainedConfig.get_known_choices()
           print("auto-discovery OK")
           EOF
-        if: ${{ matrix.lerobot == 'lerobot' }}
+        if: ${{ matrix.discovery }}
       - name: Run unit tests
-        run: pytest -v -rs lerobot_tactile_flexitac/tests lerobot_robot_so_flexitac/tests lerobot_policy_tactile/tests
+        run: pytest -v -rs lerobot-tactile-flexitac/tests lerobot-robot-so-flexitac/tests lerobot-policy-tactile/tests

@@ -1,10 +1,10 @@
 # lerobot_robot_so_flexitac
 
-SO-100 / SO-101 follower (`so_tactile_follower`) that records FlexiTac pads **losslessly as float32** in `observation.state`. Works with stock [LeRobot](https://github.com/huggingface/lerobot) 0.3.x and the latest release.
+SO-100 / SO-101 follower (`so_tactile_follower`) that records FlexiTac pads **losslessly as float32** in `observation.state`. Works with stock [LeRobot](https://github.com/huggingface/lerobot) ≥ 0.4 via the CLI (auto-discovery). On 0.3.x, import the package manually.
 
 ```bash
-pip install "git+https://github.com/TNA001-AI/lerobot-flexitac.git#subdirectory=lerobot_tactile_flexitac"
-pip install "git+https://github.com/TNA001-AI/lerobot-flexitac.git#subdirectory=lerobot_robot_so_flexitac"
+pip install "git+https://github.com/TNA001-AI/lerobot-flexitac.git#subdirectory=lerobot-tactile-flexitac"
+pip install "git+https://github.com/TNA001-AI/lerobot-flexitac.git#subdirectory=lerobot-robot-so-flexitac"
 ```
 
 ## Data layout

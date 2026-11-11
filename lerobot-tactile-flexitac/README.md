@@ -3,7 +3,7 @@
 FlexiTac (`12 × 32`, 2 Mbaud) tactile pad as a [LeRobot](https://github.com/huggingface/lerobot) stream device. Registers type `flexitac` (`FlexiTacTactileConfig` / `FlexiTacTactile`).
 
 ```bash
-pip install "git+https://github.com/TNA001-AI/lerobot-flexitac.git#subdirectory=lerobot_tactile_flexitac"
+pip install "git+https://github.com/TNA001-AI/lerobot-flexitac.git#subdirectory=lerobot-tactile-flexitac"
 ```
 
 ## Behavior

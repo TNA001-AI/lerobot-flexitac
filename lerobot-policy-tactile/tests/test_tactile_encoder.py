@@ -176,3 +176,40 @@ def test_act_tactile_rejects_mismatched_state_layout():
 
     with pytest.raises(ValueError, match="infer_tactile_layout"):
         ACTTactilePolicy(_act_tactile_config(state_dim=391))
+
+
+def test_lerobot_factory_resolves_policy_and_skips_tactile_normalization():
+    """End-to-end through LeRobot's own factory (processor pipelines exist in LeRobot >= 0.4)."""
+    factory = pytest.importorskip("lerobot.policies.factory")
+    if not hasattr(factory, "make_pre_post_processors"):
+        pytest.skip("this LeRobot version normalizes inside the policy (no processor pipelines)")
+    from lerobot.configs.types import NormalizationMode
+    from lerobot_policy_tactile.modeling_act_tactile import ACTTactilePolicy
+
+    assert factory.get_policy_class("act_tactile") is ACTTactilePolicy
+
+    cfg = _act_tactile_config()
+    cfg.normalization_mapping = {
+        "VISUAL": NormalizationMode.IDENTITY,
+        "STATE": NormalizationMode.MEAN_STD,
+        "ACTION": NormalizationMode.MEAN_STD,
+    }
+    stats = {
+        "observation.state": {"mean": torch.full((390,), 0.5), "std": torch.full((390,), 0.01)},
+        "action": {"mean": torch.zeros(6), "std": torch.ones(6)},
+    }
+    preprocessor, _ = factory.make_pre_post_processors(cfg, dataset_stats=stats)
+
+    state = torch.rand(1, 390)
+    out = preprocessor(
+        {
+            "observation.state": state.clone(),
+            "observation.images.top": torch.rand(1, 3, 64, 64),
+            "action": torch.zeros(1, 6),
+        }
+    )
+    normed = out["observation.state"].cpu()
+    # Proprioception is normalized with the dataset stats...
+    torch.testing.assert_close(normed[..., :6], (state[..., :6] - 0.5) / 0.01, rtol=1e-4, atol=1e-3)
+    # ...tactile columns pass through unchanged (no division by a near-zero std).
+    torch.testing.assert_close(normed[..., 6:], state[..., 6:], rtol=1e-5, atol=1e-5)

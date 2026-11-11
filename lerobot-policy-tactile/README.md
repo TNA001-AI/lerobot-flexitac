@@ -3,7 +3,7 @@
 LeRobot policy plugin with **LeFlexiTac** 2D tactile encoders (`TactileCNN`, `TactileAttentionCNN`, `TactileTokenEncoder`) and the `act_tactile` policy.
 
 ```bash
-pip install "git+https://github.com/TNA001-AI/lerobot-flexitac.git#subdirectory=lerobot_policy_tactile"
+pip install "git+https://github.com/TNA001-AI/lerobot-flexitac.git#subdirectory=lerobot-policy-tactile"
 ```
 
 ## How `act_tactile` uses tactile data

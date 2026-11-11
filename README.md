@@ -2,15 +2,18 @@
 
 Third-party [LeRobot](https://github.com/huggingface/lerobot) plugins for **FlexiTac** `12 × 32` array tactile sensors (via [PyFlexiTac](https://github.com/WT-MM/PyFlexiTac), 2 Mbaud USB serial). Developed for [**LeFlexiTac: Giving Robots a Sense of Touch**](https://tna001-ai.github.io/LeFlexiTac/docs.html).
 
-They install on **stock `lerobot` with no changes to LeRobot core**. LeRobot auto-discovers them by package name.
+They install on **stock `lerobot` with no changes to LeRobot core**. LeRobot ≥ 0.4 auto-discovers them by package name, so the `lerobot-*` CLIs accept the new types directly.
 
 | Package | Registers | What it does |
 | :--- | :--- | :--- |
-| [`lerobot_tactile_flexitac`](lerobot_tactile_flexitac/) | stream device `flexitac` | FlexiTac pad as a LeRobot stream device for **any robot**. Reversible `raw` or Viridis `heatmap` images, exact float32 access, optional multi-process backend. |
-| [`lerobot_robot_so_flexitac`](lerobot_robot_so_flexitac/) | robot `so_tactile_follower` | SO-100/101 follower that stores all `12 × 32 = 384` taxels per pad **losslessly as float32** in `observation.state`, with an optional full-rate CSV sidecar. |
-| [`lerobot_policy_tactile`](lerobot_policy_tactile/) | policy `act_tactile` | ACT with LeFlexiTac's 2D tactile token encoders (`TactileCNN` / `TactileAttentionCNN`). |
+| [`lerobot_tactile_flexitac`](lerobot-tactile-flexitac/) | stream device `flexitac` | FlexiTac pad as a LeRobot stream device for **any robot**. Reversible `raw` or Viridis `heatmap` images, exact float32 access, optional multi-process backend. |
+| [`lerobot_robot_so_flexitac`](lerobot-robot-so-flexitac/) | robot `so_tactile_follower` | SO-100/101 follower that stores all `12 × 32 = 384` taxels per pad **losslessly as float32** in `observation.state`, with an optional full-rate CSV sidecar. |
+| [`lerobot_policy_tactile`](lerobot-policy-tactile/) | policy `act_tactile` | ACT with LeFlexiTac's 2D tactile token encoders (`TactileCNN` / `TactileAttentionCNN`). |
 
-**Tested with:** LeRobot 0.3.4 (Python 3.11) and the latest LeRobot on PyPI (Python 3.12) in CI, plus `flexitac` 0.3.1. Unit tests use simulated hardware plus a contract test against the real `flexitac` API. Validate on your own hardware before long recordings.
+**Tested in CI with:** LeRobot 0.3.3 and 0.4.4 (Python 3.11), the latest LeRobot on PyPI (Python 3.12), and `flexitac` 0.3.1. Tests use simulated hardware, a contract test against the real `flexitac` API, and LeRobot's own plugin discovery and policy factory. Validate on your own hardware before long recordings.
+
+> [!NOTE]
+> LeRobot 0.3.x has no third-party plugin discovery. The classes work there, but you must `import lerobot_robot_so_flexitac` (or the other packages) yourself, e.g. in a Python script. The CLI flags below need LeRobot ≥ 0.4.
 
 ---
 
@@ -18,9 +21,9 @@ They install on **stock `lerobot` with no changes to LeRobot core**. LeRobot aut
 
 ```bash
 pip install lerobot          # if not installed yet
-pip install "git+https://github.com/TNA001-AI/lerobot-flexitac.git#subdirectory=lerobot_tactile_flexitac"
-pip install "git+https://github.com/TNA001-AI/lerobot-flexitac.git#subdirectory=lerobot_robot_so_flexitac"
-pip install "git+https://github.com/TNA001-AI/lerobot-flexitac.git#subdirectory=lerobot_policy_tactile"
+pip install "git+https://github.com/TNA001-AI/lerobot-flexitac.git#subdirectory=lerobot-tactile-flexitac"
+pip install "git+https://github.com/TNA001-AI/lerobot-flexitac.git#subdirectory=lerobot-robot-so-flexitac"
+pip install "git+https://github.com/TNA001-AI/lerobot-flexitac.git#subdirectory=lerobot-policy-tactile"
 ```
 
 Install in this order: the robot package depends on the tactile package. Neither declares `lerobot` as a dependency, so installing never re-resolves your existing LeRobot / torch environment. The tactile package pulls in `flexitac`, which only needs `numpy` and `pyserial` (Python ≥ 3.11).
@@ -105,7 +108,7 @@ Printable SO-10X **Moving Jaw** and **Wrist Roll** STL files and setup steps are
 
 ```bash
 pip install pytest opencv-python-headless
-pytest lerobot_tactile_flexitac/tests lerobot_robot_so_flexitac/tests lerobot_policy_tactile/tests
+pytest lerobot-tactile-flexitac/tests lerobot-robot-so-flexitac/tests lerobot-policy-tactile/tests
 ```
 
 ## Citation
