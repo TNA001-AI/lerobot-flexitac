@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lerobot_robot_so_flexitac"
+version = "0.1.0"
+description = "SO-100/101/10X follower robot plugin with lossless float32 FlexiTac tactile state"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "LeFlexiTac Authors (Columbia University RoboPIL)" },
+]
+dependencies = []
+
+[project.optional-dependencies]
+flexitac = ["flexitac>=0.1.0", "lerobot_tactile_flexitac>=0.1.0"]
+dev = ["pytest", "numpy"]
+
+[tool.setuptools.packages.find]
+include = ["lerobot_robot_so_flexitac*"]

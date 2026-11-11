@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install stock LeRobot and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install lerobot pytest opencv-python
+          pip install -e ./lerobot_tactile_flexitac --no-deps
+          pip install -e ./lerobot_robot_so_flexitac --no-deps
+          pip install -e ./lerobot_policy_tactile --no-deps
+      - name: Verify distribution names keep underscores for plugin discovery
+        run: |
+          python -c "
+          import importlib.metadata as m
+          names = {d.metadata['Name'] for d in m.distributions() if d.metadata.get('Name')}
+          for expected in ('lerobot_tactile_flexitac', 'lerobot_robot_so_flexitac', 'lerobot_policy_tactile'):
+              assert expected in names, f'{expected} missing from {names}'
+          print('Verified plugin distribution names:', expected)
+          "
+      - name: Run unit tests
+        run: |
+          pytest -v lerobot_tactile_flexitac/tests lerobot_robot_so_flexitac/tests lerobot_policy_tactile/tests

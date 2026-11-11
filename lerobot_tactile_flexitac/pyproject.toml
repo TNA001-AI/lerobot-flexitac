@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lerobot_tactile_flexitac"
+version = "0.1.0"
+description = "FlexiTac (12x32) tactile sensor plugin for LeRobot"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "LeFlexiTac Authors (Columbia University RoboPIL)" },
+]
+# Intentionally empty so installing the plugin does not re-resolve or overwrite
+# an existing lerobot / torch / opencv robot environment.
+dependencies = []
+
+[project.optional-dependencies]
+flexitac = ["flexitac>=0.1.0"]
+dev = ["pytest", "numpy", "opencv-python"]
+
+[tool.setuptools.packages.find]
+include = ["lerobot_tactile_flexitac*"]
