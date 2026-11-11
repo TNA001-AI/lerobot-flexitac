@@ -17,9 +17,9 @@ class ACTTactileConfig(ACTConfig):
     - **State mode** (default, ``tactile_keys`` empty): tactile is the contiguous tail of
       ``observation.state`` as recorded by ``so_tactile_follower``. ``proprio_state_dim`` and
       ``n_tactile_sensors`` must describe it exactly; get them with
-      ``infer_tactile_layout(names).cli_args()``. The transformer's state token then only sees
-      the proprioceptive part, and tactile columns are excluded from normalization when
-      ``override_tactile_normalization`` is set.
+      ``infer_tactile_layout(names).cli_args()``. The transformer's state token only sees the
+      (normalized) proprioceptive part; tactile columns are de-normalized inside the model
+      with dataset stats stored in the checkpoint, so the encoder sees raw ``[0, 1]`` taxels.
     - **Key mode**: list tensor keys (``observation.tactile.*``) or tactile image streams
       (``observation.images.tactile_*``). Listed image keys are routed only to the tactile
       encoder, not to the ResNet backbone.
@@ -34,7 +34,6 @@ class ACTTactileConfig(ACTConfig):
     proprio_state_dim: int = 6
     n_tactile_sensors: int = 1
     tactile_keys: list[str] = field(default_factory=list)
-    override_tactile_normalization: bool = True
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -53,6 +52,16 @@ class ACTTactileConfig(ACTConfig):
     @property
     def n_tactile_inputs(self) -> int:
         return len(self.tactile_keys) if self.tactile_keys else self.n_tactile_sensors
+
+    @property
+    def n_tactile_state_columns(self) -> int:
+        rows, cols = self.tactile_input_shape
+        return self.n_tactile_sensors * rows * cols if self.tactile_in_state else 0
+
+    @property
+    def state_normalization_mode(self):
+        mode = self.normalization_mapping.get("STATE")
+        return mode if mode is not None else "IDENTITY"
 
     @property
     def expected_state_dim(self) -> int:

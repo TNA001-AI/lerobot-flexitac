@@ -21,7 +21,7 @@ except ImportError:  # LeRobot 0.3.x
 
 from .configuration_act_tactile import ACTTactileConfig
 from .encoder import TactileTokenEncoder, extract_tactile_maps_from_batch
-from .normalization import override_tactile_stats
+from .normalization import _mode_name, tactile_denorm_params
 
 logger = logging.getLogger(__name__)
 
@@ -78,18 +78,62 @@ class ACTTactileModel(ACT):
             new.weight[: old.num_embeddings] = old.weight
         self.encoder_1d_feature_pos_embed = new
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
-        cfg = self.tactile_config
-        if not cfg.use_tactile:
-            return super().forward(batch)
+        # x_raw = x_norm * scale + offset for tactile state columns (identity until stats are set).
+        n_cols = config.n_tactile_state_columns
+        self.register_buffer("tactile_denorm_scale", torch.ones(n_cols))
+        self.register_buffer("tactile_denorm_offset", torch.zeros(n_cols))
+        self.register_buffer("tactile_denorm_ready", torch.tensor(False))
 
-        proprio_state, tactile_maps = extract_tactile_maps_from_batch(
+    def set_tactile_normalization_stats(self, dataset_stats: dict | None) -> None:
+        """Derive de-normalization buffers from the dataset stats used by the preprocessor."""
+        cfg = self.tactile_config
+        if not cfg.tactile_in_state:
+            return
+        if _mode_name(cfg.state_normalization_mode) == "IDENTITY":
+            self.tactile_denorm_scale.fill_(1.0)
+            self.tactile_denorm_offset.zero_()
+            self.tactile_denorm_ready.fill_(True)
+            return
+        if not dataset_stats or OBS_STATE not in dataset_stats:
+            return
+        scale, offset = tactile_denorm_params(
+            dataset_stats[OBS_STATE], cfg.state_normalization_mode, cfg.proprio_state_dim
+        )
+        if scale.shape[-1] != self.tactile_denorm_scale.shape[-1]:
+            raise ValueError(
+                f"observation.state stats cover {scale.shape[-1]} tactile columns, expected "
+                f"{self.tactile_denorm_scale.shape[-1]}"
+            )
+        self.tactile_denorm_scale.copy_(scale)
+        self.tactile_denorm_offset.copy_(offset)
+        self.tactile_denorm_ready.fill_(True)
+
+    def tactile_maps(self, batch: dict[str, Tensor]) -> tuple[Tensor | None, list[Tensor]]:
+        """(normalized proprio state, raw tactile maps) for an already-normalized batch."""
+        cfg = self.tactile_config
+        if cfg.tactile_in_state:
+            if not bool(self.tactile_denorm_ready) and _mode_name(cfg.state_normalization_mode) != "IDENTITY":
+                raise RuntimeError(
+                    "act_tactile has no tactile normalization stats. Build the policy with dataset_stats "
+                    "(lerobot-train does this via make_policy) or load a checkpoint trained that way."
+                )
+            state = batch[OBS_STATE]
+            tactile = state[..., cfg.proprio_state_dim :] * self.tactile_denorm_scale + self.tactile_denorm_offset
+            batch = {**batch, OBS_STATE: torch.cat([state[..., : cfg.proprio_state_dim], tactile], dim=-1)}
+        return extract_tactile_maps_from_batch(
             batch,
             tactile_shape=cfg.tactile_input_shape,
             proprio_dim=cfg.proprio_state_dim,
             n_tactile_sensors=cfg.n_tactile_sensors,
             tactile_keys=cfg.tactile_keys or None,
         )
+
+    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
+        cfg = self.tactile_config
+        if not cfg.use_tactile:
+            return super().forward(batch)
+
+        proprio_state, tactile_maps = self.tactile_maps(batch)
         # `self.config` is the backbone config: its image_features exclude tactile image keys.
         images = [batch[key] for key in self.config.image_features]
         batch_size = tactile_maps[0].shape[0]
@@ -161,10 +205,7 @@ class ACTTactilePolicy(ACTPolicy):
     name = "act_tactile"
 
     def __init__(self, config: ACTTactileConfig, **kwargs):
-        # LeRobot 0.3.x normalizes inside the policy from `dataset_stats`.
-        if kwargs.get("dataset_stats") is not None and config.tactile_in_state and config.override_tactile_normalization:
-            kwargs["dataset_stats"] = override_tactile_stats(kwargs["dataset_stats"], config.proprio_state_dim)
-
+        dataset_stats = kwargs.get("dataset_stats")
         with _ACT_SWAP_LOCK:
             original = _act_module.ACT
             _act_module.ACT = ACTTactileModel
@@ -176,3 +217,7 @@ class ACTTactilePolicy(ACTPolicy):
         if not isinstance(self.model, ACTTactileModel):
             logger.warning("ACTPolicy no longer builds via `ACT(config)`; replacing the model explicitly")
             self.model = ACTTactileModel(config)
+        if config.use_tactile:
+            # make_policy passes the dataset stats (LeRobot >= 0.4 and 0.3.x). At inference the
+            # buffers are restored from the checkpoint instead.
+            self.model.set_tactile_normalization_stats(dataset_stats)

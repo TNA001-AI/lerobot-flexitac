@@ -45,7 +45,7 @@ Find the sensor's port with `flexitac-find-port` (unplug/replug). FlexiTac board
 | `act_tactile` | key mode (`--policy.tactile_keys`) | state mode (recommended) |
 
 > [!WARNING]
-> **Normalization of tactile state.** Stock policies normalize `observation.state` per column with MEAN_STD. Rarely-touched taxels have std close to 0, so contacts get scaled to huge values. `act_tactile` excludes tactile columns from normalization by default (`override_tactile_normalization=true`). If you train a stock policy on `so_tactile_follower` data, expect this issue.
+> **Normalization of tactile state.** LeRobot normalizes `observation.state` per column (MEAN_STD by default). Rarely-touched taxels have std close to 0, so contacts get scaled to huge values. `act_tactile` undoes this inside the model: it stores the per-column inverse transform in the checkpoint and feeds raw `[0, 1]` taxels to the tactile encoder. This works the same on every LeRobot version. Stock policies trained on `so_tactile_follower` data still see the badly scaled values.
 
 > [!NOTE]
 > **What the values mean.** By default (`signal=normalized`) the map is `flexitac`'s `frame.normalized`. It is **scaled per frame by its own peak** once a contact exceeds `threshold`, so it shows the contact *shape*, not absolute pressure comparable across frames. This matches the original LeFlexiTac datasets. Use `signal=baseline_subtracted` for a fixed global scale.
